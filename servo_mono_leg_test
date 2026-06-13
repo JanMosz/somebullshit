@@ -1,0 +1,122 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver();
+
+// --- GEOMETRIA ROBOTA (w mm) ---
+const float L0 = 106.0; 
+const float L1 = 65.0;  
+const float L2 = 85.0;  
+
+// --- FIZYCZNE POZYCJE STARTOWE ---
+const int BAZA_UDO     = 75;  
+const int BAZA_KOLANO  = 60; 
+const int BAZA_KOSTKA  = 60;  
+
+bool czyDziala = false; 
+
+// Funkcja przyjmuje dokładny float i precyzyjnie mapuje na impuls PCA
+float stopnieNaImpulsFloat(float stopnie) {
+  return 150.0 + (stopnie * (450.0 - 150.0) / 180.0);
+}
+
+void ustawPozycjeIK3D(float x, float y, float z) {
+  // 1. Obliczenie kąta dla pierwszego członu (Udo)
+  float katUdoRad = atan2(z, x);
+  float katUdo = katUdoRad * 180.0 / M_PI;
+
+  // Rzutowanie trójwymiarowej pozycji stopy na płaszczyznę 2D
+  float x2d = sqrt(x*x + z*z) - L0;
+  float y2d = y;
+
+  // 2. Obliczenie dla drugiego członu (Kolano)
+  float c2 = x2d*x2d + y2d*y2d;
+  float cosBeta = (c2 - L1*L1 - L2*L2) / (-2.0 * L1 * L2);
+  cosBeta = constrain(cosBeta, -1.0, 1.0); 
+  float betaRad = acos(cosBeta);
+  float katKolano = betaRad * 180.0 / M_PI;
+
+  // 3. Obliczenie dla trzeciego członu (Kostka)
+  float alpha1 = atan2(y2d, x2d);
+  float alpha2 = acos((L2*L2 - L1*L1 - c2) / (-2.0 * L1 * sqrt(c2)));
+  float alphaRad = alpha1 + alpha2;
+  float katKostka = alphaRad * 180.0 / M_PI;
+
+  // 4. Miksowanie czystej geometrii z Twoimi pozycjami startowymi
+  float fizycznyKatUdo     = BAZA_UDO + katUdo;
+  float fizycznyKatKolano  = BAZA_KOLANO + katKolano;
+  float fizycznyKatKostka  = BAZA_KOSTKA - katKostka; 
+
+  // Zabezpieczenie przed przekroczeniem fizycznego zakresu serw
+  fizycznyKatUdo    = constrain(fizycznyKatUdo, 0.0, 180.0);
+  fizycznyKatKolano = constrain(fizycznyKatKolano, 0.0, 180.0);
+  fizycznyKatKostka = constrain(fizycznyKatKostka, 0.0, 180.0);
+
+  // 5. Wysłanie sygnałów do kanałów PCA9685
+  pca.setPWM(4, 0, (int)stopnieNaImpulsFloat(fizycznyKatUdo));     // KANAŁ 4  - UDO
+  pca.setPWM(8, 0, (int)stopnieNaImpulsFloat(fizycznyKatKolano));  // KANAŁ 8  - KOLANO
+  pca.setPWM(12, 0, (int)stopnieNaImpulsFloat(fizycznyKatKostka)); // KANAŁ 12 - KOSTKA
+}
+
+void sprawdzSerial() {
+  if (Serial.available() > 0) {
+    char znak = Serial.read();
+    if (znak == ' ') { 
+      czyDziala = !czyDziala;
+      Serial.println(czyDziala ? ">>> START: Poziomy kwadrat" : "<<< PAUZA");
+    } 
+    else if (znak == '0') {
+      czyDziala = false;
+      Serial.println("<<< RESET do pozycji bezpiecznej");
+      ustawPozycjeIK3D(80, -90, 0); 
+    }
+    else if (znak != '\n' && znak != '\r') {
+      czyDziala = false;
+      Serial.println("<<< STOP BEZPIECZENSTWA");
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pca.begin();
+  pca.setPWMFreq(50); 
+  ustawPozycjeIK3D(80, -90, 0); // Pozycja startowa (środek poziomu)
+}
+
+void loop() {
+  sprawdzSerial();
+
+  if (czyDziala) {
+    // TRAJEKTORIA: Poziomy kwadrat 10cm x 10cm na stałej wysokości Y = -90mm
+    // Rozpiętość: X od 40 do 140 mm, Z od -50 do 50 mm.
+    
+    // Krok 1: Ruch w bok (oś Z rośnie od -50 do 50, noga wysunięta w przód na X=140)
+    for (float z = -50; z <= 50 && czyDziala; z += 4.0) { 
+      ustawPozycjeIK3D(140, -90, z); 
+      delay(45); 
+      sprawdzSerial(); 
+    }
+    
+    // Krok 2: Ruch w tył ku robotowi (oś X maleje od 140 do 40, noga wychylona w boku na Z=50)
+    for (float x = 140; x >= 40 && czyDziala; x -= 4.0) { 
+      ustawPozycjeIK3D(x, -90, 50); 
+      delay(45); 
+      sprawdzSerial();
+    }
+    
+    // Krok 3: Ruch w bok powrotny (oś Z maleje od 50 do -50, noga cofnięta na X=40)
+    for (float z = 50; z >= -50 && czyDziala; z -= 4.0) { 
+      ustawPozycjeIK3D(40, -90, z); 
+      delay(45); 
+      sprawdzSerial();
+    }
+    
+    // Krok 4: Ruch w przód od robota (oś X rośnie od 40 do 140, noga wychylona w boku na Z=-50)
+    for (float x = 40; x <= 140 && czyDziala; x += 4.0) { 
+      ustawPozycjeIK3D(x, -90, -50); 
+      delay(45); 
+      sprawdzSerial();
+    }
+  }
+}
