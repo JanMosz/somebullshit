@@ -1,0 +1,148 @@
+#include <WiFi.h>
+#include <NetworkClient.h>
+#include <WiFiAP.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// Dane sieci Wi-Fi
+const char *ssid = "Robot_Sterowanie";
+const char *password = "12345678";
+
+NetworkServer server(80);
+
+// Inicjalizacja sterownika serw (domyślny adres I2C to 0x40)
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+
+// Definicje szerokości impulsów dla serw (standardowo dla serw 9g / MG90S)
+#define SERVOMIN  150 // Minimalna długość impulsu (0 stopni)
+#define SERVOMAX  500 // Maksymalna długość impulsu (180 stopni)
+
+// Liczba obsługiwanych serw
+const int LICZBA_SERW = 9;
+
+// Funkcja pomocnicza do ustawiania kąta (0-180) na konkretnym kanale PCA
+void ustawKat(uint8_t kanal, int kat) {
+  int pulse = map(kat, 0, 180, SERVOMIN, SERVOMAX);
+  pwm.setPWM(kanal, 0, pulse);
+}
+
+// Funkcja ustawiająca wszystkie 9 serw w pozycję startową (np. 90 stopni)
+void pozycjaStartowa() {
+  Serial.println("[ROBOT] Ustawianie pozycji startowej (90 stopni)...");
+  for (int i = 0; i < LICZBA_SERW; i++) {
+    ustawKat(i, 90);
+    delay(50); // Małe opóźnienie, żeby nie obciążyć zasilacza nagłym szarpnięciem prądu
+  }
+}
+
+// Sekwencja ruchowa (przykład: "Młynek" / machanie serwami)
+void wykonajRuch() {
+  Serial.println("[ROBOT] Uruchamianie sekwencji ruchu!");
+  
+  // Ruch w jedną stronę
+  for (int kat = 90; kat <= 150; kat += 5) {
+    for (int i = 0; i < LICZBA_SERW; i++) {
+      ustawKat(i, kat);
+    }
+    delay(20);
+  }
+  
+  delay(200);
+
+  // Ruch w drugą stronę
+  for (int kat = 150; kat >= 30; kat -= 5) {
+    for (int i = 0; i < LICZBA_SERW; i++) {
+      ustawKat(i, kat);
+    }
+    delay(20);
+  }
+
+  delay(200);
+  
+  // Powrót do środka
+  for (int kat = 30; kat <= 90; kat += 5) {
+    for (int i = 0; i < LICZBA_SERW; i++) {
+      ustawKat(i, kat);
+    }
+    delay(20);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Start magistrali I2C na domyślnych pinach ESP32 (SDA=21, SCL=22)
+  Wire.begin(21, 22);
+  
+  // Start sterownika serw
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(50); // Serwa analogowe pracują na 50Hz
+
+  // Ustawienie robota na pozycję "zero" przy uruchomieniu
+  pozycjaStartowa();
+
+  // Start sieci Wi-Fi
+  Serial.println("\nKonfigurowanie Punktu Dostępowego...");
+  if (!WiFi.softAP(ssid, password)) {
+    Serial.println("Błąd Wi-Fi.");
+    while(1);
+  }
+  
+  IPAddress myIP = WiFi.softAPIP();
+  Serial.print("Robot gotowy! Adres IP: ");
+  Serial.println(myIP);
+  
+  server.begin();
+}
+
+void loop() {
+  NetworkClient client = server.accept(); 
+
+  if (client) {                             
+    String currentLine = "";                
+    while (client.connected()) {            
+      if (client.available()) {             
+        char c = client.read();             
+        if (c == '\n') {                    
+          if (currentLine.length() == 0) {
+            
+            // Wysyłanie strony WWW do telefonu
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html");
+            client.println("Connection: close");
+            client.println();
+            
+            client.println("<!DOCTYPE html><html>");
+            client.println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" charset=\"UTF-8\">");
+            client.println("<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
+            client.println(".button { background-color: #4CAF50; border: none; color: white; padding: 20px 50px;");
+            client.println("text-decoration: none; font-size: 30px; margin: 5px; cursor: pointer; width: 80%; border-radius: 10px;}");
+            client.println(".button2 {background-color: #008CBA;} </style></head>");
+            
+            client.println("<body><h1>Panel Sterowania Robotem</h1>");
+            client.println("<p><a href=\"/RUCH\"><button class=\"button\">URUCHOM RUCH (9 serw)</button></a></p>");
+            client.println("<p><a href=\"/RESET\"><button class=\"button button2\">POZYCJA STARTOWA</button></a></p>");
+            
+            client.println("</body></html>");
+            client.println();
+            break;
+          } else {
+            currentLine = "";
+          }
+        } else if (c != '\r') {
+          currentLine += c;      
+        }
+
+        // Reakcja na przyciski ze strony WWW
+        if (currentLine.endsWith("GET /RUCH")) {
+          wykonajRuch();
+        }
+        if (currentLine.endsWith("GET /RESET")) {
+          pozycjaStartowa();
+        }
+      }
+    }
+    client.stop();
+  }
+}
