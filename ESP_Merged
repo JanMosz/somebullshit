@@ -1,0 +1,360 @@
+#include <Wire.h> // 
+#include <cmath> // 
+#include <Adafruit_PWMServoDriver.h> // [cite: 29]
+
+// =====================================================================
+// KONFIGURACJA PINÓW I SPRZĘTU
+// =====================================================================
+// Piny I2C dla Żyroskopu
+#define GYRO_SDA_PIN 7 // 
+#define GYRO_SCL_PIN 6 // 
+
+// Piny I2C dla Sterownika Serw PCA9685
+const int SDA_PIN = 11; // 
+const int SCL_PIN = 10; // 
+
+// Piny UART do komunikacji z Raspberry Pi
+#define ESP_RX_PIN 44 // 
+#define ESP_TX_PIN 43 // 
+
+// Inicjalizacja sterownika serw na DRUGIEJ magistrali I2C (Wire1)
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40, Wire1); // [cite: 29]
+
+#define USMIN  500   // [cite: 29]
+#define USMAX  2500  // [cite: 29]
+#define SERVO_FREQ 50 // [cite: 29]
+
+// =====================================================================
+// USTAWIENIA ŻYROSKOPU
+// =====================================================================
+#define PROG_ALARMOWY 45.0 // 
+uint8_t znaleziony_adres = 0x68; // 
+float przefiltrowany_pitch = 0.0; // [cite: 2]
+float przefiltrowany_roll = 0.0; // [cite: 2]
+const float alfa = 0.20; // [cite: 2]
+
+float offset_pitch = 0.0; // [cite: 2]
+float offset_roll = 0.0; // [cite: 3]
+bool stan_alarmu = false; // [cite: 3]
+
+// =====================================================================
+// GEOMETRIA I STAN ROBOTA
+// =====================================================================
+float currentThigh = 90.0; // 
+float currentKnee = 90.0;  // 
+
+const int KNEE_STAND = 45; // [cite: 31]
+const int KNEE_LIFT = 75;  // [cite: 31]
+const int THIGH_BASE = 90; // [cite: 31]
+const int SWING_AMP = 20;  // [cite: 31]
+const int SWING_DIR[5] = {1, 1, 1, 1, 1}; // [cite: 32]
+
+bool trybAwaryjny = false; // [cite: 32]
+
+// =====================================================================
+// FUNKCJE POMOCNICZE ŻYROSKOPU
+// =====================================================================
+void wpiszRejestr(byte reg, byte wartosc) {
+  Wire.beginTransmission(znaleziony_adres); // [cite: 3]
+  Wire.write(reg); // [cite: 3]
+  Wire.write(wartosc); // [cite: 3]
+  Wire.endTransmission(); // [cite: 3]
+}
+
+void odczytajZyroskop() {
+  Wire.beginTransmission(znaleziony_adres); // [cite: 15]
+  Wire.write(0x0C); // [cite: 15]
+  if (Wire.endTransmission(false) != 0) { return; } // [cite: 16]
+
+  Wire.requestFrom(znaleziony_adres, (uint8_t)6); // [cite: 16]
+  
+  if (Wire.available() == 6) { // [cite: 17]
+    int16_t rawX = Wire.read() | (Wire.read() << 8); // [cite: 17]
+    int16_t rawY = Wire.read() | (Wire.read() << 8); // [cite: 18]
+    int16_t rawZ = Wire.read() | (Wire.read() << 8); // [cite: 18]
+
+    float accX = rawX / 16384.0; // [cite: 19]
+    float accY = rawY / 16384.0; // [cite: 19]
+    float accZ = rawZ / 16384.0; // [cite: 19]
+
+    float surowy_pitch = atan2(accX, sqrt(accY * accY + accZ * accZ)) * 180.0 / M_PI; // [cite: 20]
+    float surowy_roll = atan2(accY, sqrt(accX * accX + accZ * accZ)) * 180.0 / M_PI; // [cite: 21]
+
+    surowy_pitch -= offset_pitch; // [cite: 21]
+    surowy_roll -= offset_roll; // [cite: 22]
+
+    przefiltrowany_pitch = (alfa * surowy_pitch) + ((1.0 - alfa) * przefiltrowany_pitch); // [cite: 22]
+    przefiltrowany_roll = (alfa * surowy_roll) + ((1.0 - alfa) * przefiltrowany_roll); // [cite: 23]
+
+    bool przekroczono_pitch = abs(przefiltrowany_pitch) >= PROG_ALARMOWY; // [cite: 23]
+    bool przekroczono_roll = abs(przefiltrowany_roll) >= PROG_ALARMOWY; // [cite: 24]
+
+    if (przekroczono_pitch || przekroczono_roll) {
+      if (!stan_alarmu) {
+        Serial.println("!!! WYKRYTO UPADEK ROBOTA !!! Odetnij zasilanie serw.");
+        Serial2.println("ALARM"); // Wysyłka alertu do Maliny [cite: 25]
+        stan_alarmu = true; // [cite: 25]
+        
+        // INTERWENCJA: Automatyczne zabezpieczenie sprzętu przy wywrotce
+        trybAwaryjny = true;
+        odetnijZasilanieSerw();
+      }
+    } else {
+      if (stan_alarmu) {
+        Serial.println("Robot wrocil do bezpiecznej pozycji.");
+        Serial2.println("OK"); // Informacja dla Maliny, że jest w porządku [cite: 27]
+        stan_alarmu = false; // [cite: 28]
+      }
+    }
+  }
+}
+
+// =====================================================================
+// FUNKCJE BEZPIECZEŃSTWA I RUCHU SERW
+// =====================================================================
+void odetnijZasilanieSerw() {
+  for (int i = 0; i < 16; i++) {
+    pwm.setPWM(i, 0, 0); // Odcięcie sygnału sterującego - serwa idą na luz [cite: 33, 34]
+  }
+}
+
+void wyswietlKomunikatEstop() {
+  Serial.println("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  Serial.println("!!! NIEBEZPIECZEŃSTWO: WYŁĄCZNIK AWARYJNY !!!"); // [cite: 37]
+  Serial.println("!!! Serwa odcięte. Wpisz '0', aby odblokować. !!!"); // [cite: 37]
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+}
+
+// Zmodyfikowany delay: wykonuje krokowe opóźnienie, cały czas monitorując żyroskop i UART
+bool bezpiecznyDelay(int ms) {
+  unsigned long start = millis(); // 
+  while (millis() - start < ms) { // [cite: 35]
+    
+    // 1. Sprawdzaj pozycję żyroskopu w czasie rzeczywistym podczas ruchu
+    odczytajZyroskop();
+    if (trybAwaryjny) return true; // Przerwij ruch, jeśli żyroskop wykrył wywrotkę
+
+    // 2. Nasłuchuj komend E-STOP z PC USB
+    if (Serial.available() > 0) {
+      char c = Serial.read(); // [cite: 35]
+      if (c == 'x' || c == 'X' || c == 's' || c == 'S') { // [cite: 36]
+        trybAwaryjny = true; // [cite: 36]
+        odetnijZasilanieSerw(); // [cite: 36]
+        wyswietlKomunikatEstop();
+        return true; // [cite: 37]
+      }
+    }
+
+    // 3. Nasłuchuj komend E-STOP z Raspberry Pi (UART)
+    if (Serial2.available() > 0) {
+      char c = Serial2.read();
+      if (c == 'x' || c == 'X' || c == 's' || c == 'S') { // Obsługa 's' lub 'S' wysłanego z Maliny
+        trybAwaryjny = true;
+        odetnijZasilanieSerw();
+        wyswietlKomunikatEstop();
+        return true;
+      }
+    }
+    delay(5); // Małe odciążenie procesora
+  }
+  return false; // [cite: 38]
+}
+
+void ruszSerwo(int noga, bool czyKolano, int kat) {
+  if (trybAwaryjny) return; // [cite: 39]
+  int pin = (noga * 2) + (czyKolano ? 1 : 0); // [cite: 40]
+  int pulse = map(kat, 0, 180, USMIN, USMAX); // [cite: 40]
+  pwm.writeMicroseconds(pin, pulse); // [cite: 41]
+}
+
+void pozycjaStoj() {
+  if (trybAwaryjny) return; // [cite: 41]
+  for (int i = 0; i < 5; i++) {
+    ruszSerwo(i, false, THIGH_BASE); // [cite: 41]
+    ruszSerwo(i, true, KNEE_STAND); // [cite: 42]
+  }
+  currentThigh = THIGH_BASE; // [cite: 42]
+  currentKnee = KNEE_STAND; // [cite: 42]
+}
+
+bool plynnyRuch(float celUdo, float celKolano, int czas_ms) {
+  int kroki = 40; // [cite: 43]
+  int krok_delay = czas_ms / kroki; // [cite: 44]
+  float startUdo = currentThigh; // [cite: 44]
+  float startKolano = currentKnee; // [cite: 44]
+  for (int i = 1; i <= kroki; i++) { // [cite: 45]
+    if (trybAwaryjny) return false; // [cite: 45]
+    float t = (float)i / (float)kroki; // [cite: 46]
+    currentThigh = startUdo + (celUdo - startUdo) * t; // [cite: 46]
+    currentKnee = startKolano + (celKolano - startKolano) * t; // [cite: 47]
+
+    for (int n = 0; n < 5; n++) {
+      ruszSerwo(n, false, currentThigh); // [cite: 47]
+      ruszSerwo(n, true, currentKnee); // [cite: 48]
+    }
+    if (bezpiecznyDelay(krok_delay)) return false; // [cite: 48]
+  }
+  return true; // [cite: 48]
+}
+
+bool cyklObrotuWaveGait(int kierunek) {
+  for (int noga = 0; noga < 5; noga++) { // [cite: 49]
+    if (trybAwaryjny) return false; // [cite: 49]
+    int kat_uda_cel = THIGH_BASE + (SWING_AMP * SWING_DIR[noga] * kierunek); // [cite: 50]
+
+    ruszSerwo(noga, true, KNEE_LIFT); // [cite: 50]
+    if (bezpiecznyDelay(120)) return false; // [cite: 50]
+
+    ruszSerwo(noga, false, kat_uda_cel); // [cite: 50]
+    if (bezpiecznyDelay(120)) return false; // [cite: 51]
+
+    ruszSerwo(noga, true, KNEE_STAND); // [cite: 51]
+    if (bezpiecznyDelay(120)) return false; // [cite: 51]
+  }
+
+  int kroki_interpolacji = 20; // [cite: 52]
+  for (int k = 0; k <= kroki_interpolacji; k++) { // [cite: 53]
+    if (trybAwaryjny) return false; // [cite: 53]
+    float t = (float)k / (float)kroki_interpolacji; // [cite: 54]
+
+    for (int noga = 0; noga < 5; noga++) {
+      int kat_uda_start = THIGH_BASE + (SWING_AMP * SWING_DIR[noga] * kierunek); // [cite: 54]
+      int kat_teraz = kat_uda_start + (THIGH_BASE - kat_uda_start) * t; // [cite: 55]
+      ruszSerwo(noga, false, kat_teraz); // [cite: 55]
+    }
+    if (bezpiecznyDelay(15)) return false; // [cite: 56]
+  }
+  return !bezpiecznyDelay(150); // [cite: 56]
+}
+
+// =====================================================================
+// KONFIGURACJA POCZĄTKOWA SYSTEMU (SETUP)
+// =====================================================================
+void setup() {
+  Serial.begin(115200); // Monitor USB dla komputera [cite: 4]
+  Serial2.begin(115200, SERIAL_8N1, ESP_RX_PIN, ESP_TX_PIN); // Port UART dla Maliny 
+
+  // Uruchomienie I2C dla Żyroskopu
+  Wire.begin(GYRO_SDA_PIN, GYRO_SCL_PIN); // 
+  delay(100); // 
+
+  // Wykrywanie i konfiguracja sensora żyroskopu
+  bool wykryto_sensor = false; // [cite: 6]
+  Wire.beginTransmission(0x68); // [cite: 6]
+  if (Wire.endTransmission() == 0) { znaleziony_adres = 0x68; wykryto_sensor = true; } // [cite: 6]
+  else { Wire.beginTransmission(0x69); if (Wire.endTransmission() == 0) { znaleziony_adres = 0x69; wykryto_sensor = true; } } // [cite: 7]
+
+  if (wykryto_sensor) {
+    wpiszRejestr(0x7E, 0x11); // [cite: 8]
+    delay(20); // [cite: 8]
+    wpiszRejestr(0x7E, 0x15); // [cite: 8]
+    delay(100); // [cite: 9]
+
+    // Autokalibracja żyroskopu
+    float suma_pitch = 0; // [cite: 9]
+    float suma_roll = 0; // [cite: 9]
+    for (int i = 0; i < 50; i++) { // [cite: 10]
+      Wire.beginTransmission(znaleziony_adres); // [cite: 10]
+      Wire.write(0x0C); // [cite: 10]
+      Wire.endTransmission(false); // [cite: 10]
+      Wire.requestFrom(znaleziony_adres, (uint8_t)6); // [cite: 10]
+      if (Wire.available() == 6) { // [cite: 11]
+        int16_t rawX = Wire.read() | (Wire.read() << 8); // [cite: 11]
+        int16_t rawY = Wire.read() | (Wire.read() << 8); // [cite: 12]
+        int16_t rawZ = Wire.read() | (Wire.read() << 8); // [cite: 12]
+        suma_pitch += atan2(rawX, sqrt(rawY * rawY + rawZ * rawZ)) * 180.0 / M_PI; // [cite: 13]
+        suma_roll += atan2(rawY, sqrt(rawX * rawX + rawZ * rawZ)) * 180.0 / M_PI; // [cite: 14]
+      }
+      delay(10); // [cite: 14]
+    }
+    offset_pitch = suma_pitch / 50.0; // [cite: 15]
+    offset_roll = suma_roll / 50.0; // [cite: 15]
+    Serial.println("[SYSTEM] Żyroskop skonfigurowany i skalibrowany.");
+  } else {
+    Serial.println("[BŁĄD] Nie wykryto żyroskopu! Ochrona wywrotki nieaktywna.");
+  }
+
+  // Uruchomienie DRUGIEJ linii I2C dla sterownika serw PCA9685
+  Wire1.begin(SDA_PIN, SCL_PIN); // [cite: 56]
+  pwm.begin(); // [cite: 57]
+  pwm.setOscillatorFrequency(27000000); // [cite: 57]
+  pwm.setPWMFreq(SERVO_FREQ); // [cite: 57]
+
+  pozycjaStoj(); // Ustawienie robota w pozycji stojącej na starcie [cite: 57]
+  
+  Serial.println("\n=== SYSTEM ESP ZINTEGROWANY Z MALINĄ ZAINICJALIZOWANY ===");
+  Serial.println("  [SPACJA] -> Płynne wstawanie"); // [cite: 57]
+  Serial.println("  [r] / [o] -> Obrót (kręć się)"); // [cite: 58]
+  Serial.println("  [p]       -> Idź do przodu");
+  Serial.println("  [0]       -> Pozycja leżąca / Reset awarii"); // [cite: 59]
+  Serial.println("  [x] / [s] -> !!! AWARYJNE ODCIĘCIE SERW !!!"); // [cite: 60]
+  Serial.println("==========================================================");
+}
+
+// =====================================================================
+// GŁÓWNA PĘTLA PROGRAMU (LOOP)
+// =====================================================================
+void loop() {
+  // Stały pomiar żyroskopu, kiedy robot stoi bezczynnie
+  odczytajZyroskop();
+  
+  char znak = 0;
+  
+  // Odczyt komend z komputera (USB) lub z Raspberry Pi (Serial2)
+  if (Serial.available() > 0) {
+    znak = Serial.read(); // [cite: 61]
+  } else if (Serial2.available() > 0) {
+    znak = Serial2.read();
+  }
+
+  if (znak != 0) {
+    // Jeśli jesteśmy w trybie awaryjnym, reagujemy WYLĄCZNIE na '0' (odblokowanie/reset)
+    if (trybAwaryjny) { // 
+      if (znak == '0') { // 
+        trybAwaryjny = false; // 
+        Serial.println("-> Tryb awaryjny wyłączony. Podnoszę robota..."); // [cite: 63]
+        pozycjaStoj(); // [cite: 63]
+      }
+      return; // [cite: 63]
+    }
+
+    // --- PARSER KOMEND MENU ---
+    if (znak == ' ') { // [cite: 64]
+      Serial.println("-> Rozkaz: Wstawanie..."); // [cite: 64]
+      plynnyRuch(90.0, KNEE_STAND, 1200); // [cite: 65]
+    } 
+    else if (znak == '0') { // [cite: 70]
+      Serial.println("-> Rozkaz: Siadanie..."); // [cite: 70]
+      plynnyRuch(90.0, 90.0, 1200); // [cite: 71]
+    }
+    else if (znak == 'r' || znak == 'R' || znak == 'o' || znak == 'O') { // 'r' z PC lub 'o' z Maliny
+      Serial.println("-> Rozkaz: Obrót w prawo / Obracaj się..."); // [cite: 65]
+      int cykle = 8; // [cite: 66]
+      for (int c = 0; c < cykle; c++) { // [cite: 66]
+        if (!cyklObrotuWaveGait(1)) break; // Przerywa obrót, jeśli włączono E-STOP [cite: 66]
+      }
+      if (!trybAwaryjny) pozycjaStoj(); // [cite: 67]
+    }
+    else if (znak == 'l' || znak == 'L') { // [cite: 68]
+      Serial.println("-> Rozkaz: Obrót w lewo..."); // [cite: 68]
+      int cykle = 8; // [cite: 69]
+      for (int c = 0; c < cykle; c++) { // [cite: 69]
+        if (!cyklObrotuWaveGait(-1)) break; // [cite: 69]
+      }
+      if (!trybAwaryjny) pozycjaStoj(); // [cite: 70]
+    }
+    else if (znak == 'p' || znak == 'P') { // Komenda 'p' wysłana z Maliny
+      Serial.println("-> Rozkaz: Marsz do przodu...");
+      // TUTAJ MOŻESZ WSTWIĆ DEDYKOWANĄ FUNKCJĘ MARSZU W PRZÓD (np. cyklMarszuDoPrzodu())
+      // Na razie dla testów robot po prostu potwierdza pozycję stojącą
+      pozycjaStoj(); 
+    }
+    else if (znak == 'x' || znak == 'X' || znak == 's' || znak == 'S') { // Ręczny wyłącznik awaryjny (lub litera 's' z Maliny) [cite: 71]
+      trybAwaryjny = true; // [cite: 71]
+      odetnijZasilanieSerw(); // [cite: 72]
+      wyswietlKomunikatEstop();
+    }
+  }
+  
+  delay(20); // [cite: 28]
+}
