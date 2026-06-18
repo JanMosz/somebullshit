@@ -1,0 +1,117 @@
+#include <Wire.h>
+#include <cmath>
+
+#define GYRO_SDA_PIN 7
+#define GYRO_SCL_PIN 6
+
+// Piny do komunikacji z Raspberry Pi
+#define ESP_RX_PIN 44
+#define ESP_TX_PIN 43
+
+#define PROG_ALARMOWY 45.0 
+
+uint8_t znaleziony_adres = 0x68; 
+
+float przefiltrowany_pitch = 0.0;
+float przefiltrowany_roll = 0.0;
+const float alfa = 0.20; 
+
+float offset_pitch = 0.0;
+float offset_roll = 0.0;
+
+bool stan_alarmu = false;
+
+void wpiszRejestr(byte reg, byte wartosc) {
+  Wire.beginTransmission(znaleziony_adres);
+  Wire.write(reg);
+  Wire.write(wartosc);
+  Wire.endTransmission();
+}
+
+void setup() {
+  // Monitor szeregowy na PC (USB)
+  Serial.begin(115200);
+  
+  // Port szeregowy do Raspberry Pi (Piny 44 i 43)
+  Serial2.begin(115200, SERIAL_8N1, ESP_RX_PIN, ESP_TX_PIN);
+
+  Wire.begin(GYRO_SDA_PIN, GYRO_SCL_PIN);
+  delay(100);
+
+  bool wykryto_sensor = false;
+  Wire.beginTransmission(0x68);
+  if (Wire.endTransmission() == 0) { znaleziony_adres = 0x68; wykryto_sensor = true; }
+  else { Wire.beginTransmission(0x69); if (Wire.endTransmission() == 0) { znaleziony_adres = 0x69; wykryto_sensor = true; } }
+
+  if (!wykryto_sensor) { return; }
+
+  wpiszRejestr(0x7E, 0x11); 
+  delay(20);
+  wpiszRejestr(0x7E, 0x15); 
+  delay(100); 
+
+  // Prosta autokalibracja
+  float suma_pitch = 0;
+  float suma_roll = 0;
+  for (int i = 0; i < 50; i++) {
+    Wire.beginTransmission(znaleziony_adres);
+    Wire.write(0x0C);
+    Wire.endTransmission(false);
+    Wire.requestFrom(znaleziony_adres, (uint8_t)6);
+    if (Wire.available() == 6) {
+      int16_t rawX = Wire.read() | (Wire.read() << 8);
+      int16_t rawY = Wire.read() | (Wire.read() << 8);
+      int16_t rawZ = Wire.read() | (Wire.read() << 8);
+      suma_pitch += atan2(rawX, sqrt(rawY * rawY + rawZ * rawZ)) * 180.0 / M_PI;
+      suma_roll += atan2(rawY, sqrt(rawX * rawX + rawZ * rawZ)) * 180.0 / M_PI;
+    }
+    delay(10);
+  }
+  offset_pitch = suma_pitch / 50.0;
+  offset_roll = suma_roll / 50.0;
+}
+
+void loop() {
+  Wire.beginTransmission(znaleziony_adres);
+  Wire.write(0x0C); 
+  if (Wire.endTransmission(false) != 0) { return; }
+
+  Wire.requestFrom(znaleziony_adres, (uint8_t)6);
+  
+  if (Wire.available() == 6) {
+    int16_t rawX = Wire.read() | (Wire.read() << 8);
+    int16_t rawY = Wire.read() | (Wire.read() << 8);
+    int16_t rawZ = Wire.read() | (Wire.read() << 8);
+
+    float accX = rawX / 16384.0;
+    float accY = rawY / 16384.0;
+    float accZ = rawZ / 16384.0;
+
+    float surowy_pitch = atan2(accX, sqrt(accY * accY + accZ * accZ)) * 180.0 / M_PI;
+    float surowy_roll = atan2(accY, sqrt(accX * accX + accZ * accZ)) * 180.0 / M_PI;
+
+    surowy_pitch -= offset_pitch;
+    surowy_roll -= offset_roll;
+
+    przefiltrowany_pitch = (alfa * surowy_pitch) + ((1.0 - alfa) * przefiltrowany_pitch);
+    przefiltrowany_roll = (alfa * surowy_roll) + ((1.0 - alfa) * przefiltrowany_roll);
+
+    bool przekroczono_pitch = abs(przefiltrowany_pitch) >= PROG_ALARMOWY;
+    bool przekroczono_roll = abs(przefiltrowany_roll) >= PROG_ALARMOWY;
+
+    if (przekroczono_pitch || przekroczono_roll) {
+      if (!stan_alarmu) {
+        Serial.println("Wysylam ALARM do Raspberry Pi...");
+        Serial2.println("ALARM"); // Wysyłka do Maliny
+        stan_alarmu = true;
+      }
+    } else {
+      if (stan_alarmu) {
+        Serial.println("Wysylam OK do Raspberry Pi...");
+        Serial2.println("OK"); // Wysyłka do Maliny
+        stan_alarmu = false;
+      }
+    }
+  }
+  delay(20); 
+}
