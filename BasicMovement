@@ -1,0 +1,193 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+#define USMIN  500  
+#define USMAX  2500 
+#define SERVO_FREQ 50
+
+const int SCL_PIN = 10;
+const int SDA_PIN = 11;
+
+// --- STAN AKTUALNY I GEOMETRIA ---
+float currentThigh = 90.0;
+float currentKnee = 90.0;
+
+const int KNEE_STAND = 45; 
+const int KNEE_LIFT = 75;  
+const int THIGH_BASE = 90; 
+const int SWING_AMP = 20;  
+
+const int SWING_DIR[5] = {1, 1, 1, 1, 1}; 
+
+// Flaga bezpieczeństwa
+bool trybAwaryjny = false;
+
+// Funkcja całkowicie odcinająca prąd od silników serw (idą na luz)
+void odetnijZasilanieSerw() {
+  for (int i = 0; i < 16; i++) {
+    pwm.setPWM(i, 0, 0); // 0,0 oznacza brak sygnału sterującego = serwo staje się luźne
+  }
+}
+
+// INTELIGENTNY DELAY: Czeka, ale cały czas nasłuchuje klawisza 'x'
+// Zwraca 'true' jeśli wykryto stop, 'false' jeśli czas minął normalnie
+bool bezpiecznyDelay(int ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (Serial.available() > 0) {
+      char c = Serial.read();
+      if (c == 'x' || c == 'X') {
+        trybAwaryjny = true;
+        odetnijZasilanieSerw();
+        Serial.println("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        Serial.println("!!! NIEBEZPIECZEŃSTWO: WYŁĄCZNIK AWARYJNY !!!");
+        Serial.println("!!! Serwa odcięte. Wpisz '0', aby odblokować. !!!");
+        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void ruszSerwo(int noga, bool czyKolano, int kat) {
+  if (trybAwaryjny) return;
+  int pin = (noga * 2) + (czyKolano ? 1 : 0);
+  int pulse = map(kat, 0, 180, USMIN, USMAX);
+  pwm.writeMicroseconds(pin, pulse);
+}
+
+void pozycjaStoj() {
+  if (trybAwaryjny) return;
+  for (int i = 0; i < 5; i++) {
+    ruszSerwo(i, false, THIGH_BASE);
+    ruszSerwo(i, true, KNEE_STAND);
+  }
+  currentThigh = THIGH_BASE;
+  currentKnee = KNEE_STAND;
+}
+
+// Płynne wstawanie/siadanie z ochroną awaryjną
+bool plynnyRuch(float celUdo, float celKolano, int czas_ms) {
+  int kroki = 40; 
+  int krok_delay = czas_ms / kroki;
+  float startUdo = currentThigh;
+  float startKolano = currentKnee;
+
+  for (int i = 1; i <= kroki; i++) {
+    if (trybAwaryjny) return false;
+    
+    float t = (float)i / (float)kroki;
+    currentThigh = startUdo + (celUdo - startUdo) * t;
+    currentKnee = startKolano + (celKolano - startKolano) * t;
+
+    for (int n = 0; n < 5; n++) {
+      ruszSerwo(n, false, currentThigh);
+      ruszSerwo(n, true, currentKnee);
+    }
+    
+    if (bezpiecznyDelay(krok_delay)) return false; 
+  }
+  return true;
+}
+
+// Cykl chodu z ochroną awaryjną
+bool cyklObrotuWaveGait(int kierunek) {
+  for (int noga = 0; noga < 5; noga++) {
+    if (trybAwaryjny) return false;
+    int kat_uda_cel = THIGH_BASE + (SWING_AMP * SWING_DIR[noga] * kierunek);
+
+    ruszSerwo(noga, true, KNEE_LIFT);
+    if (bezpiecznyDelay(120)) return false;
+
+    ruszSerwo(noga, false, kat_uda_cel);
+    if (bezpiecznyDelay(120)) return false;
+
+    ruszSerwo(noga, true, KNEE_STAND);
+    if (bezpiecznyDelay(120)) return false;
+  }
+
+  // Obrót korpusu
+  int kroki_interpolacji = 20;
+  for (int k = 0; k <= kroki_interpolacji; k++) {
+    if (trybAwaryjny) return false;
+    float t = (float)k / (float)kroki_interpolacji;
+
+    for (int noga = 0; noga < 5; noga++) {
+      int kat_uda_start = THIGH_BASE + (SWING_AMP * SWING_DIR[noga] * kierunek);
+      int kat_teraz = kat_uda_start + (THIGH_BASE - kat_uda_start) * t;
+      ruszSerwo(noga, false, kat_teraz);
+    }
+    if (bezpiecznyDelay(15)) return false;
+  }
+  return !bezpiecznyDelay(150);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Wire.begin(SDA_PIN, SCL_PIN);
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(SERVO_FREQ);
+
+  pozycjaStoj();
+  
+  Serial.println("\n=== SYSTEM URUCHOMIONY Z E-STOP ===");
+  Serial.println("  [SPACJA] -> Płynne wstawanie");
+  Serial.println("  [r] / [l] -> Obrót o 360 stopni");
+  Serial.println("  [0]       -> Powrót do bazy / Odblokowanie po awarii");
+  Serial.println("  [x]       -> !!! AWARYJNE ODCIĘCIE SERW (INSTANT) !!!");
+  Serial.println("==================================================");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char znak = Serial.read();
+
+    // Jeśli jesteśmy w trybie awaryjnym, reagujemy TYLKO na '0' (reset)
+    if (trybAwaryjny) {
+      if (znak == '0') {
+        trybAwaryjny = false;
+        Serial.println("-> Tryb awaryjny wyłączony. Podnoszę robota do pozycji stojącej...");
+        pozycjaStoj();
+      }
+      return; 
+    }
+
+    // Normalne menu sterowania
+    if (znak == ' ') {
+      Serial.println("-> Wstawanie...");
+      plynnyRuch(90.0, KNEE_STAND, 1200);
+    } 
+    else if (znak == 'r' || znak == 'R') {
+      Serial.println("-> Obrót w prawo...");
+      int cykle = 8;
+      for (int c = 0; c < cykle; c++) {
+        if (!cyklObrotuWaveGait(1)) break; // Przerywa pętlę, jeśli poszedł E-stop
+      }
+      if (!trybAwaryjny) pozycjaStoj();
+    }
+    else if (znak == 'l' || znak == 'L') {
+      Serial.println("-> Obrót w lewo...");
+      int cykle = 8;
+      for (int c = 0; c < cykle; c++) {
+        if (!cyklObrotuWaveGait(-1)) break;
+      }
+      if (!trybAwaryjny) pozycjaStoj();
+    }
+    else if (znak == '0') {
+      Serial.println("-> Siadanie...");
+      plynnyRuch(90.0, 90.0, 1200);
+    }
+    else if (znak == 'x' || znak == 'X') {
+      // Reakcja na x, gdyby robot stał w miejscu i coś zaczęło syczeć
+      trybAwaryjny = true;
+      odetnijZasilanieSerw();
+      Serial.println("!!! E-STOP W BEZRUCHU !!!");
+    }
+  }
+}
